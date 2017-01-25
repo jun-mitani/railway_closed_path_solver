@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+	<meta charset="utf-8">
+	<title>Railway Closed Path Solver</title>
+<style type="text/css">
+body {
+	font-family: "KozGoPro-Light", "小塚ゴシック Pro L", "ヒラギノ角ゴ ProN W3", "Hiragino Kaku Gothic ProN", "游ゴシック", YuGothic, "メイリオ", Meiryo, sans-serif;
+	font-size: 10pt;
+	color: #000000;
+	line-height: 150%;
+	overflow:auto;
+}
+
+#left {
+	float: left;
+	margin: 0px;
+	overflow: auto;
+	top: 0px;
+	left: 0px;
+	width: 260px;
+	height: 800px;
+	padding-bottom: 10px;
+}
+
+#app {
+	margin: 0px 0px 0px 260px;
+  	width: 800px; 
+	padding: 20px;
+}
+
+H1 {
+	font-size: 16pt;
+	margin: 5px;
+}
+
+H2 {
+	font-size: 12pt;
+	font-weight: bold;
+	margin: 10px 5px 5px 5px;
+}
+
+em {
+	font-weight: bold;	
+	color: #0000CC;
+	font-style: normal;	
+}
+
+.explain {
+	margin-left: 10px;
+}
+</style>
+<script type="text/javascript">
+// 2017 Jun Mitani
+
+var MAX_UNIT_NUM_IN_SEARCH_PATH = 12;
+
+// レール端点座標(i+ma, j+na) a=1/√2
+function RailCoord(i, m, j, n){ 
+	if(arguments.length == 1) { // 配列で渡されたときのコンストラクタ
+		this.i = i[0];
+		this.m = i[1];
+		this.j = i[2];
+		this.n = i[3];
+	} else {
+		this.i = i;
+		this.m = m;
+		this.j = j;
+		this.n = n;
+	}
+}
+
+function getRailCoord(p, a){ // RailCoordオブジェクトの座標値と配列の値を加算した新しいRailCoordを返す
+	return new RailCoord(p.i + a[0], p.m + a[1], p.j + a[2], p.n + a[3]);
+}
+
+function sqaredDistanceFromOrigin(p) {
+	return (p.i + p.m * 1.41421356) * (p.i + p.m * 1.41421356) + (p.j + p.n * 1.41421356) * (p.j + p.n * 1.41421356);
+}
+
+RailCoord.prototype.add = function(coord) {
+	this.i += coord[0];
+	this.m += coord[1];
+	this.j += coord[2];
+	this.n += coord[3];
+}
+
+RailCoord.prototype.equals = function(p) {
+	return this.i == p.i && this.m == p.m && this.j == p.j && this.n == p.n;
+}
+
+var originalCourseEndCoord; // 描画終了時に設定される
+var originalCourseEndAngle; // 描画終了時に設定される
+
+// 幅優先探索 キュー： ref http://stackoverflow.com/questions/34000830/breadth-first-search-algorithm
+var Queue = function() { this.items = []; };
+Queue.prototype.enqueue = function(obj) { this.items.push(obj); };
+Queue.prototype.dequeue = function() { return this.items.shift(); };
+Queue.prototype.isEmpty = function() { return this.items.length === 0; };
+    
+// 進入角度における座標値増分（x整数, xの1/√2係数、y整数、yの1/√2係数）
+var mapS = [
+  [ 1, 0, 0, 0], // 0 deg
+  [ 0, 1, 0, 1], // 45
+  [ 0, 0, 1, 0], // 90
+  [ 0,-1, 0, 1], //135
+  [-1, 0, 0, 0], //180 
+  [ 0,-1, 0,-1], //225
+  [ 0, 0,-1, 0], //270
+  [ 0, 1, 0,-1], //315
+];
+
+var mapR = [
+  [ 0, 1,-1, 1], // 0 
+  [ 0, 1, 1,-1], // 45
+  [ 1,-1, 0, 1], // 90
+  [-1, 1, 0, 1], //135
+  [ 0,-1, 1,-1], //180 
+  [ 0,-1,-1, 1], //225
+  [-1, 1, 0,-1], //270
+  [ 1,-1, 0,-1], //315
+];
+
+var mapL = [
+  [ 0, 1, 1,-1], // 0 
+  [ 1,-1, 0, 1], // 45
+  [-1, 1, 0, 1], // 90
+  [ 0,-1, 1,-1], //135
+  [ 0,-1,-1, 1], //180 
+  [-1, 1, 0,-1], //225
+  [ 1,-1, 0,-1], //270
+  [ 0, 1,-1, 1], //315
+];
+
+// 負数にも対応した剰余計算
+function mod(i, j) { return (i % j) < 0 ? (i % j) + 0 + (j < 0 ? -j : j) : (i % j + 0); }
+
+// レール基本単位 
+function RailUnit(type, angleIN, angleOUT){ 
+	this.type = type; // S,L,R
+	this.angleIN  = angleIN; // 進入角度
+	this.angleOUT = angleOUT; // 出ていく角度
+}
+
+var anotherRouteStrArr = ""; // 別ルート表現文字列
+var useDifferentColor = true; // 別ルートは違う色で表示するか否か
+
+var anotherRouteCount; // 別ルート発見数
+
+// [別のレールは違う色を使う]チェックボックスに対するイベント処理
+function useDifferentColorPressed() {
+	useDifferentColor =  document.forms.id_form1.id_diff_color.checked;
+	draw();
+}
+
+
+// 入力コースが更新されたときに呼ばれる	
+function cleanAnotherPath() {
+	anotherRouteCount = 0;
+	//updateRouteIndexHTML();
+	document.getElementById("anotherRailInfo").innerHTML = "";
+}
+
+// Queueの要素
+// 現在の位置、接続角度、そこに至るまでのルート（RSLを様子とする文字列）
+function QueueElement(railArr, endPosition, angleOutIndex) {
+	this.railArr = railArr;
+	this.endPosition = endPosition
+	this.angleOutIndex = angleOutIndex;
+}
+
+function queueDebug(elem) {
+	console.log("debug:" + elem.railArr + "(" + elem.endPosition.i + "," + elem.endPosition.m + "," + elem.endPosition.j + "," + elem.endPosition.n + ")" );
+}
+
+// ref http://blog.livedoor.jp/dankogai/archives/51763909.html
+binsearch = function(ary, val, cmp) {
+    cmp = cmp || function(a, b) { return a === b ? 0 : a < b ? -1 : 1 };
+    var head = 0,
+        tail = ary.length - 1,
+        here, that, h, m, t;
+    while (head <= tail) {
+        here = head + ((tail - head) >> 1);
+        that = cmp(ary[here], val);
+        if (0 === that) {   /* if found, binary-search the boundary */
+            h = 0, t = here;
+            while (h <= t) {
+                m = h + ((t - h) >> 1);
+                if (0 === cmp(ary[m], val)) t = m - 1;
+                else                        h = m + 1;
+            }
+            head = h;
+            h = here, t = ary.length;
+            while (h <= t) {
+                m = h + ((t - h) >> 1);
+                if (0 === cmp(ary[m], val)) h = m + 1;
+                else                        t = m - 1;
+            }
+            tail = t;
+            return { found: true, head: head, tail: tail };
+        }
+        if (0 < that) tail = here - 1;
+        else          head = here + 1;
+    }
+    return { found: false, head: tail, tail: head };
+};
+
+insert = function(ary, val, cmp) {
+    var s = binsearch(ary, val, cmp);
+    if(!s.found) { 
+		ary.splice(s.tail, 0, val);
+		return true;
+	} else {
+		//console.log("重複発見");
+		queueDebug(val);
+		queueDebug(ary[s.head]);
+	}
+	
+    return false;
+};	
+var cmpPoint = function(a, b) { 
+	if(a.endPosition.i != b.endPosition.i) return a.endPosition.i - b.endPosition.i;
+	if(a.endPosition.m != b.endPosition.m) return a.endPosition.m - b.endPosition.m;
+	if(a.endPosition.j != b.endPosition.j) return a.endPosition.j - b.endPosition.j;
+	if(a.endPosition.n != b.endPosition.n) return a.endPosition.n - b.endPosition.n;
+	if(a.angleOutIndex != b.angleOutIndex) return a.angleOutIndex - b.angleOutIndex;
+	return 0;
+}
+var pointSortedList;
+
+// ボタン押下時の処理
+function genPath() {
+	anotherRouteCount = 0;
+	if(document.getElementById("maxCount_8").checked) MAX_UNIT_NUM_IN_SEARCH_PATH = 8;
+	if(document.getElementById("maxCount_12").checked) MAX_UNIT_NUM_IN_SEARCH_PATH = 12;
+	if(document.getElementById("maxCount_16").checked) MAX_UNIT_NUM_IN_SEARCH_PATH = 16;
+	if(document.getElementById("maxCount_20").checked) MAX_UNIT_NUM_IN_SEARCH_PATH = 20;
+
+	var queue = new Queue();
+	pointSortedList = [];
+
+	var k = mod(originalCourseEndAngle, 360)/45;
+	queue.enqueue(new QueueElement("R", getRailCoord( originalCourseEndCoord, mapR[k]), (k+7)%8));
+	queue.enqueue(new QueueElement("S", getRailCoord( originalCourseEndCoord, mapS[k]), k));
+	queue.enqueue(new QueueElement("L", getRailCoord( originalCourseEndCoord, mapL[k]), (k+1)%8));
+	var startPosition = new RailCoord(0, 0, 0, 0);
+
+	console.time('timer1');
+
+	var debugCount = 0;
+	while(!queue.isEmpty()){
+		
+		var nxt = queue.dequeue();
+		//queueDebug(nxt);
+		
+		// 探索の深さの上限で打ち切り
+		if(nxt.railArr.length > MAX_UNIT_NUM_IN_SEARCH_PATH) {
+			//console.log("not Found");
+			break;
+		}
+
+		// オリジナルコースの解始点に角度90度で戻ってくればOK
+		if(nxt.endPosition.equals(startPosition) && nxt.angleOutIndex == 2 ) {
+			console.log("found path:" + nxt.railArr);
+			anotherRouteCount = 1;
+			anotherRouteStrArr = nxt.railArr;
+			break;
+		}
+		
+		var mapIndex = nxt.angleOutIndex;
+		
+		if(insert(pointSortedList, nxt, cmpPoint)) {
+			if(nxt.railArr.length <= MAX_UNIT_NUM_IN_SEARCH_PATH/2)  {
+		
+				queue.enqueue(new QueueElement(nxt.railArr + "R", getRailCoord(nxt.endPosition, mapR[mapIndex]), (nxt.angleOutIndex+7)%8));
+				queue.enqueue(new QueueElement(nxt.railArr + "S", getRailCoord(nxt.endPosition, mapS[mapIndex]), nxt.angleOutIndex));
+				queue.enqueue(new QueueElement(nxt.railArr + "L", getRailCoord(nxt.endPosition, mapL[mapIndex]), (nxt.angleOutIndex+1)%8));
+			} else {
+				// 半分を超えたら明らかに残りのレールで戻ってこれない場合を枝刈する
+				var nxtR = getRailCoord(nxt.endPosition, mapR[mapIndex]);
+				var nxtS = getRailCoord(nxt.endPosition, mapS[mapIndex]);
+				var nxtL = getRailCoord(nxt.endPosition, mapL[mapIndex]);
+				var maxDist2 = nxt.railArr.length * nxt.railArr.length;
+				if(sqaredDistanceFromOrigin(nxtR) < maxDist2) queue.enqueue(new QueueElement(nxt.railArr + "R", nxtR, (nxt.angleOutIndex+7)%8));
+				if(sqaredDistanceFromOrigin(nxtS) < maxDist2) queue.enqueue(new QueueElement(nxt.railArr + "S", nxtS, nxt.angleOutIndex));
+				if(sqaredDistanceFromOrigin(nxtL) < maxDist2) queue.enqueue(new QueueElement(nxt.railArr + "L", nxtL, (nxt.angleOutIndex+1)%8));			
+			}
+		}
+	}
+	console.timeEnd('timer1');
+
+	if(anotherRouteCount == 0) {
+		document.getElementById("anotherRailInfo").innerHTML = 
+		'<font color="red">レール数' + MAX_UNIT_NUM_IN_SEARCH_PATH + '本以内ではルートが見つかりませんでした</font>';
+	} else {
+		document.getElementById("anotherRailInfo").innerHTML = "ルートが見つかりました(レール数 " + anotherRouteStrArr.length + " : " + anotherRouteStrArr + ")";
+	}
+	
+	draw();
+}
+
+
+	const ARC_ANGLE = Math.PI*0.25;
+	const UNIT_LENGTH = 80;
+
+	var courseArray;
+	const canvasName = 'mycanvas';
+	const lineWidthArray = [12, 10, 6, 4];
+	const colorArray = ["#1970c1", "#51b5ff", "#1970c1", "#51b5ff"]; // 入力コース
+	const colorArray2 = ["#19c170", "#51ffb5", "#19c170", "#51ffb5"]; // 別ルート
+	const colorHead = "#51b5ff";
+
+	const INIT_X = 400;
+	const INIT_Y = 200;
+	
+	// 終点位置
+	var endX;
+	var endY;
+	
+	// 終点の角度
+	var endAngleDeg; // 水平ゼロ度 反時計回り
+	
+	var bLoopCourse = false; // 閉じたループにするか
+	var screenScale = 1.0;
+	var screenMoveX = 0;
+	var screenMoveY = 0;
+	
+	var preMouseX;
+	var preMouseY;
+	
+	var maxX, maxY, minX, miY;
+	
+	var historyData = new Array();
+	
+	function initCourse() {
+		endX = INIT_X;
+		endY = INIT_Y;
+		endAngleDeg = 90;
+	}
+
+	function drawPoint(ctx, head) {
+		if(head) {
+			ctx.fillStyle = colorHead;
+			ctx.beginPath();
+			ctx.arc(endX, endY, 2, 0, Math.PI*2, true);
+			ctx.fill();
+		} else {
+			ctx.fillStyle = 'rgb(255, 255, 255)';
+			ctx.beginPath();
+			ctx.arc(endX, endY, 3, 0, Math.PI*2, true);
+			ctx.fill();
+		}
+		
+		minX = Math.min(minX, endX);
+		maxX = Math.max(maxX, endX);
+		minY = Math.min(minY, endY);
+		maxY = Math.max(maxY, endY);
+	}
+
+	function drawStraightLine(ctx, sx, sy, ex, ey) {
+		ctx.beginPath();
+		ctx.moveTo(sx, sy);
+		ctx.lineTo(ex, ey);
+		ctx.stroke();
+	}
+	
+	// 直線	   
+	function drawStraightRail(ctx) {
+		drawPoint(ctx, true);
+		var sx = endX;
+		var sy = endY;
+		var ex = sx + UNIT_LENGTH * Math.cos(endAngleDeg * Math.PI / 180.0);
+		var ey = sy + UNIT_LENGTH * Math.sin(endAngleDeg * Math.PI / 180.0);
+		
+		for (var i = 0; i < 4; i++) {
+			ctx.lineWidth = lineWidthArray[i];
+			if(!drawingAnotherCourse || !useDifferentColor) {
+				ctx.strokeStyle = colorArray[i];
+			} else {
+				ctx.strokeStyle = colorArray2[i];			
+			}
+			drawStraightLine(ctx, sx, sy, ex, ey);
+		}
+
+		endX = ex;
+		endY = ey;
+		
+		drawPoint(ctx, false);
+
+		if(!drawingAnotherCourse) {	// 別ルート描画時は対象外
+			railOriginalRoute.push( new RailUnit("S", endAngleDeg, endAngleDeg) );
+			var mapIndex = mod(endAngleDeg, 360)/45;
+			//console.log("mapIndex S =" + mapIndex);
+			originalCourseEndCoord.add(mapS[mapIndex]);
+			originalCourseEndAngle = endAngleDeg;
+		}
+	}
+	
+	
+	function drawCurve(ctx, cx, cy, r, sa, ea, boo) {
+		ctx.beginPath();
+		ctx.arc(cx, cy, r, sa, ea, boo);
+		ctx.stroke();
+	}
+	
+	// L曲線	   
+	function drawLCurveRail(ctx) {
+		drawPoint(ctx, true);
+
+		var cx = endX - UNIT_LENGTH * Math.sin((endAngleDeg)* Math.PI / 180.0);
+		var cy = endY + UNIT_LENGTH * Math.cos((endAngleDeg)* Math.PI / 180.0);
+		var sa = (endAngleDeg - 90) * Math.PI / 180.0;
+		var ea = (endAngleDeg - 45) * Math.PI / 180.0;
+		
+		for (var i = 0; i < 4; i++) {
+			ctx.lineWidth = lineWidthArray[i];
+			if(!drawingAnotherCourse || !useDifferentColor) {
+				ctx.strokeStyle = colorArray[i];
+			} else {
+				ctx.strokeStyle = colorArray2[i];			
+			}
+			drawCurve(ctx, cx, cy, UNIT_LENGTH, sa, ea, false); 
+		}
+		
+		endX = cx + UNIT_LENGTH * Math.cos((endAngleDeg - 45) * Math.PI / 180.0);
+		endY = cy + UNIT_LENGTH * Math.sin((endAngleDeg - 45) * Math.PI / 180.0);
+		endAngleDeg += 45;
+
+		drawPoint(ctx, false);
+		if(!drawingAnotherCourse) {
+			railOriginalRoute.push( new RailUnit("L", endAngleDeg-45, endAngleDeg) );
+			var mapIndex = mod(endAngleDeg-45, 360)/45;
+			//console.log("mapIndex L =" + mapIndex);
+			originalCourseEndCoord.add(mapL[mapIndex]);
+			originalCourseEndAngle = endAngleDeg;
+		}
+	}
+	
+	// R曲線	   
+	function drawRCurveRail(ctx) {
+		drawPoint(ctx, true);
+
+		var cx = endX + UNIT_LENGTH * Math.sin((endAngleDeg)* Math.PI / 180.0);
+		var cy = endY - UNIT_LENGTH * Math.cos((endAngleDeg)* Math.PI / 180.0);
+		var sa = (endAngleDeg + 90) * Math.PI / 180.0;
+		var ea = (endAngleDeg + 45) * Math.PI / 180.0;
+		
+		for (var i = 0; i < 4; i++) {
+			ctx.lineWidth = lineWidthArray[i];
+			if(!drawingAnotherCourse || !useDifferentColor) {
+				ctx.strokeStyle = colorArray[i];
+			} else {
+				ctx.strokeStyle = colorArray2[i];			
+			}
+			drawCurve(ctx, cx, cy, UNIT_LENGTH, ea, sa, false); 
+		}
+		
+		endX = cx + UNIT_LENGTH * Math.cos((endAngleDeg + 45) * Math.PI / 180.0);
+		endY = cy + UNIT_LENGTH * Math.sin((endAngleDeg + 45) * Math.PI / 180.0);
+		endAngleDeg -= 45;
+
+		drawPoint(ctx, false);
+		if(!drawingAnotherCourse) {
+			railOriginalRoute.push( new RailUnit("R", endAngleDeg+45, endAngleDeg) );
+			var mapIndex = mod(endAngleDeg+45, 360)/45;
+			//console.log("mapIndex R =" + mapIndex);
+			originalCourseEndCoord.add(mapR[mapIndex]);
+			originalCourseEndAngle = endAngleDeg;
+		}
+	}
+
+	var drawingAnotherCourse = false;
+	function drawAnotherCourse(ctx) {
+	//	endAngleDeg = 270;
+		drawingAnotherCourse = true;
+			//console.log("anotherRouteStrArr="+anotherRouteStrArr + "len=" + anotherRouteStrArr.length);
+		for(var i = 0; i < anotherRouteStrArr.length; i++) {
+			var letter = anotherRouteStrArr.charAt(i);
+			switch(letter) {
+				case "R": case "r":  drawRCurveRail(ctx);  break;
+				case "L": case "l":  drawLCurveRail(ctx);  break;
+				case "S": case "s":  drawStraightRail(ctx); break;
+			}
+		}
+		drawingAnotherCourse = false;
+	}
+	 
+	function drawCourse(ctx, bSecondDraw) {
+		railOriginalRoute = new Array();
+		originalCourseEndCoord = new RailCoord(0, 0, 0, 0);
+		
+		minX = minY = Number.MAX_SAFE_INTEGER;
+		maxX = maxY = -Number.MAX_SAFE_INTEGER;
+		
+		
+		var count_straight = 0;
+		var count_curve = 0;
+		for (var i = 0; i < (bLoopCourse ? 8:1); i++) {
+			for(var j = 0; j < courseArray.length; j++) {
+				var repeatNum = 1;
+				var nextRailType = "";
+				switch(courseArray[j]) {
+				case "R": case "r": 
+				case "L": case "l": 
+				case "S": case "s": nextRailType = courseArray[j];  break;
+				default: 
+					var t = parseInt(courseArray[j], 10);
+					if(t > 0 && t < 10) {
+						repeatNum = t;
+						j++;
+						nextRailType = courseArray[j];
+					}
+				}
+				
+				for(var k = 0; k < repeatNum; k++) {
+					switch(nextRailType) {
+					case "R": case "r":  drawRCurveRail(ctx);  count_curve++; break;
+					case "L": case "l":  drawLCurveRail(ctx);  count_curve++; break;
+					case "S": case "s":  drawStraightRail(ctx); count_straight++; break;
+					}
+				}
+			}
+		}
+		
+		
+		if(bLoopCourse && !bSecondDraw) {
+			setViewForWholeShape(ctx);
+		}
+		
+		document.getElementById("rail_count").innerHTML = "曲線 " + count_curve + " / 直線 " + count_straight;
+		
+/* 		console.log("-originalCourseEndCoord-> " 
+ 			+ originalCourseEndCoord.i + ","
+ 			+ originalCourseEndCoord.m + ","
+ 			+ originalCourseEndCoord.j + ","
+ 			+ originalCourseEndCoord.n 
+ 		);*/
+	}
+	
+	function setViewForWholeShape(ctx) {
+		var canvas = document.getElementById(canvasName);
+		
+		var cx = (minX + maxX)/2;
+		var cy = (minY + maxY)/2;
+		var w = maxX - minX;
+		var s = 0.8 * canvas.height / w;
+		
+		// 適切なスケールと位置で再描画
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, canvas.width, canvas.height);
+				
+		ctx.translate(0, canvas.height);
+		ctx.scale(1, -1);
+		
+	
+		ctx.translate( canvas.width/2, canvas.height/2);
+		ctx.scale(s, s);
+		ctx.translate(-cx, -cy);
+		initCourse();
+		drawCourse(ctx, true);
+	}
+		
+	function draw(){
+		var canvas = document.getElementById(canvasName);
+		
+		if (canvas.getContext){
+			var ctx = canvas.getContext('2d');
+			
+			ctx.lineWidth = 10;
+			ctx.strokeStyle = 'rgb(0, 0, 255)';
+			ctx.fillStyle = 'rgb(255, 255, 255)';
+			
+			ctx.setTransform(1, 0, 0, 1, 0, 0);
+			ctx.clearRect(0, 0, canvas.width, canvas.height);
+				
+			ctx.translate(0, canvas.height);
+			ctx.translate(screenMoveX, screenMoveY);
+			ctx.scale(1, -1);
+
+			ctx.translate( canvas.width/2, canvas.height/2);
+			ctx.scale(screenScale, screenScale);
+			ctx.translate(-canvas.width/2, -canvas.height/2);
+			initCourse();
+			drawCourse(ctx, false);
+			
+			if(anotherRouteCount > 0) {
+				//initCourse();
+				drawAnotherCourse(ctx);
+			}
+		}
+	}
+	
+	function dataUpdate() {
+		var course = document.forms.id_form1.id_textBox1.value;
+		historyData.push(course);
+		courseArray = course.split("");
+
+		bLoopCourse =  document.forms.id_form1.id_loop.checked;
+
+		window.location.hash = course + "," + (bLoopCourse ? "1" : "0");
+
+		initCourse();
+		draw();
+	}
+	
+	function clearData() {
+		document.forms.id_form1.id_textBox1.value = "";
+		screenScale = 1;
+		screenMoveX = 0;
+		screenMoveY = 0;
+		dataUpdate();
+	}
+	
+	function init() {
+		var hash = window.location.hash.substring(1) || "SRRRS,0";
+		var hashArray = hash.split(",");
+
+		courseArray = hashArray[0].split("");
+		document.forms.id_form1.id_textBox1.value = hashArray[0];
+
+		bLoopCourse = hashArray[1] === "1";
+		document.forms.id_form1.id_loop.checked = bLoopCourse;
+
+		var canvas = document.getElementById(canvasName);
+		canvas.addEventListener('mousedown',  onMouseDown,  false);
+		canvas.addEventListener('mouseup',	onMouseUp,	false);
+		canvas.addEventListener('mousemove',  onMouseMove,  false);
+		
+		var mousewheelevent = 'onwheel' in document ? 'wheel' : 'onmousewheel' in document ? 'mousewheel' : 'DOMMouseScroll';
+		try{
+			document.addEventListener (mousewheelevent, onMouseWheel, false);
+		}catch(e){
+			//for legacy IE
+			document.attachEvent ("onmousewheel", onMouseWheel);
+		}
+		
+		draw();
+	}
+
+	function onMouseMove(e) {
+		var data = e.buttons;
+		var button_l = ((data & 0x0001) ? true : false);
+
+		if(button_l){
+			var rect = e.target.getBoundingClientRect();
+			var x = e.clientX - rect.left;
+   	 		var y = e.clientY - rect.top;
+		
+			var diffX = x - preMouseX;
+		 	var diffY = y - preMouseY;
+		
+			screenMoveX += diffX;
+			screenMoveY += diffY;
+		
+			preMouseX = x;
+			preMouseY = y;
+		
+			draw();
+		}
+		e.preventDefault();
+	}
+
+	function onMouseDown(e) {
+		var rect = e.target.getBoundingClientRect();
+		preMouseX = e.clientX - rect.left;
+		preMouseY = e.clientY - rect.top;
+	}
+
+	function onMouseUp(e) { }
+
+	function onMouseWheel(e) {
+		var e = window.event || e; // old IE support
+		var delta = e.deltaY ? -(e.deltaY) : e.wheelDelta ? e.wheelDelta : -(e.detail);
+		screenScale += 0.1 * ((delta < 0) ? -1: 1);
+		if(screenScale <= 0) { screenScale = 0.1; }
+		draw();
+		e.preventDefault();
+	}
+	
+	function buttonPressed(letter) {
+		document.forms.id_form1.id_textBox1.value += letter;
+		dataUpdate();
+	}
+	
+	function randomCreate() {
+		var newCourseArray = "";
+		var diff = 0;
+		var randomVal2 = Math.floor(Math.random() * 3);
+		var num = 7 + Math.floor(Math.random() * 3);
+		for(var j = 0; j < num; j++) { 
+			var randomVal1 = Math.floor(Math.random() * 2)+1;
+			switch(randomVal2) {
+				case 0: for(var i = 0; i < randomVal1; i++) {newCourseArray += "L"; diff++;} break;
+				case 1: for(var i = 0; i < randomVal1; i++) {newCourseArray += "R"; diff--;} break;
+				case 2: for(var i = 0; i < randomVal1; i++) {newCourseArray += "S"; } break;
+			}
+			
+			var adiff = Math.abs(diff);
+			//if(newCourseArray.length > 8 && (adiff == 1 || adiff == 3 || adiff == 5 || adiff == 7)) break;	
+			//if(newCourseArray.length > 8 && (adiff == 3 || adiff == 5 || adiff == 7)) break;	
+			randomVal2 = (randomVal2 + 1 + Math.floor(Math.random() * 1)) % 3;
+		}
+		document.forms.id_form1.id_textBox1.value = newCourseArray;
+		dataUpdate();
+	}
+	
+	function backHistory() {
+		if(historyData.length == 0) return;
+		historyData.pop();
+		if(historyData.length == 0) {
+			document.forms.id_form1.id_textBox1.value = "";
+		} else {
+			document.forms.id_form1.id_textBox1.value = historyData.pop();
+		}
+		dataUpdate();
+	
+	}
+	
+	function deleteLast() {
+		var len = document.forms.id_form1.id_textBox1.value.length;
+		if(len > 0) {
+			document.forms.id_form1.id_textBox1.value = 
+			document.forms.id_form1.id_textBox1.value.substr(0,len-1);
+		}
+		dataUpdate();
+	}
+	
+	</script>
+	<style type="text/css">
+	  canvas { border: 1px solid #000000; }
+	</style>
+  </head>
+  <body onload='
+  document.getElementById("hide").style.display="none";
+  init();'>
+  <div id="main">
+  <div id="left">
+  <H2>鉄道模型コースシミュレータ</h2>
+  <H1>【閉路探索ツール】</h1>
+  <hr>  
+  <h2>説明</h2>
+  <div class="explain">
+  [閉じるルートを生成]ボタンを押すと、入力されたコースを含む閉路を自動生成します。<br>
+  
+  <br>
+  <h2>注意</h2>
+  指定された数のレールで作れる閉路が存在しないことがあります。<br>
+  レール数が多いと、いつまでたっても処理が終わらないことがあります。その場合は、ブラウザを閉じて終了させてください。<br>
+  <br>
+  （Chrome上のみで動作確認しています）<br><br>
+  関連アプリはこちらです。<br>
+  <a href="http://mitani.cs.tsukuba.ac.jp/ja/software/railway/index.html" target="_blank">鉄道模型コースシミュレータ</a><br>
+  <a href="http://mitani.cs.tsukuba.ac.jp/ja/software/railway_puzzle/index.html" target="_blank">レールパズル</a><br>
+   <br>
+
+  </div>
+ 
+  </div>
+  <div id="app">
+  <form name="form1" id="id_form1" action="">
+	コース表記  <input name="textBox1" id="id_textBox1" type="text" value="" size="40"
+	onkeydown="cleanAnotherPath();dataUpdate();" onkeyup="cleanAnotherPath();dataUpdate();" onkeypress="cleanAnotherPath();dataUpdate();" />
+	<input type="button" value="S" onclick="cleanAnotherPath();buttonPressed('S');" />
+	<input type="button" value="R" onclick="cleanAnotherPath();buttonPressed('R');" />
+	<input type="button" value="L" onclick="cleanAnotherPath();buttonPressed('L');" />
+	<input type="button" value="一文字削除" onclick="cleanAnotherPath();deleteLast();" />
+	<input type="button" value="クリア" onclick="cleanAnotherPath();clearData();" />
+	<input type="button" value="ランダム" onclick="cleanAnotherPath();randomCreate();" />
+	<input type="button" value="1つ前" onclick="cleanAnotherPath();backHistory();" />
+	<br>
+	探索上限（レール数）
+	<input type="radio" name="maxCount" id="maxCount_8" value="8" checked/>8 &nbsp;&nbsp;
+	<input type="radio" name="maxCount" id="maxCount_12" value="12" />12 &nbsp;&nbsp;
+	<input type="radio" name="maxCount" id="maxCount_16" value="16" />16 &nbsp;&nbsp;
+	<input type="radio" name="maxCount" id="maxCount_20" value="20" />20 &nbsp;&nbsp;
+	<br>
+	<input type="button" value="閉じるルートを生成" onclick="genPath();" />
+	<span id="anotherRailInfo"></span><br>
+	<input type="checkbox" value="Loop" onclick="useDifferentColorPressed();" id="id_diff_color" checked/>別ルートは別の色で表示する
+<div id="hide">
+	<input type="checkbox" value="Loop" onclick="dataUpdate();" id="id_loop"/>ループ
+</div>
+  </form>
+  <div id="rail_count"></div>
+  <canvas id="mycanvas" width="800" height="600"></canvas>
+	マウスホイールで拡大縮小、左マウスドラッグで表示位置の移動ができます。
+   <div style="text-align: right;"> 2017.1.25 Jun Mitani <a href="http://mitani.cs.tsukuba.ac.jp/ja/" target="_blank">(Web)</a> <a href="https://twitter.com/jmitani" target="＿blank">(Twitter)</a></div>
+  </div>
+  </div>
+  
+  </body>
+</html>
